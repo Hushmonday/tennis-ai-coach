@@ -1,0 +1,20 @@
+# ===== frontend (Vite/React) =====
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.env
+frontend/.env.*
+
+# ===== backend (Python/FastAPI) =====
+backend/venv/
+backend/__pycache__/
+backend/**/*.pyc
+backend/.env
+backend/.env.*
+backend/uploads/
+
+# ===== OS =====
+.DS_Store
+
+# ===== Logs =====
+*.log
