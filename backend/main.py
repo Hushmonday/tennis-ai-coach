@@ -3,8 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 import os, uuid, json
 import numpy as np
 import cv2
-
+from nova_client import nova_coach_feedback
 import mediapipe as mp
+from dotenv import load_dotenv
+load_dotenv()
 
 app = FastAPI()
 
@@ -444,6 +446,23 @@ async def analyze(
     sample_idx = list(range(0, len(frames_kps), max(1, len(frames_kps)//8)))[:8]
     keypoints_sample = [{"t": times[i], "kps": frames_kps[i]} for i in sample_idx]
 
+        # ---------- Nova coach feedback ----------
+    coach_feedback = None
+    nova_error = None
+    try:
+        coach_feedback = nova_coach_feedback(
+            {
+                "shot_type": shot_type,
+                "handedness": handedness,
+                "camera_angle": cam,
+                "metrics": metrics,
+                "flags": flags,
+                "perfect_standard": perfect,
+            }
+        )
+    except Exception as e:
+        nova_error = str(e)
+
     return {
         "ok": True,
         "saved": fname,
@@ -458,4 +477,6 @@ async def analyze(
         "flags": flags,
         "perfect_standard": perfect,
         "keypoints_sample": keypoints_sample,
+        "coach_feedback": coach_feedback,
+        "nova_error": nova_error,
     }
