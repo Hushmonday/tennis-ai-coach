@@ -1,14 +1,45 @@
+from dotenv import load_dotenv
+import os
+import warnings
+
+# Reduce noisy native logs from MediaPipe / TFLite.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("GLOG_minloglevel", "2")
+os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "2")
+
+# Suppress known protobuf deprecation warning from third-party dependencies.
+warnings.filterwarnings(
+    "ignore",
+    message=r"SymbolDatabase.GetPrototype\(\) is deprecated\..*",
+    category=UserWarning,
+)
+
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+
 import os, uuid, json
 import numpy as np
 import cv2
-from nova_client import nova_coach_feedback
 import mediapipe as mp
-from dotenv import load_dotenv
-load_dotenv()
 
+try:
+    from absl import logging as absl_logging
+
+    absl_logging.set_verbosity(absl_logging.ERROR)
+    absl_logging.set_stderrthreshold(absl_logging.ERROR)
+except Exception:
+    pass
+
+from nova_client import nova_coach_feedback
+load_dotenv()
 app = FastAPI()
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 
 # (Optional) allow frontend dev server
 app.add_middleware(
@@ -23,6 +54,7 @@ UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 mp_pose = mp.solutions.pose
+FOLLOW_THROUGH_MIN_NORM = 0.015
 
 # ---------- geometry helpers ----------
 def angle_abc(a, b, c) -> float:
@@ -147,41 +179,75 @@ def kp_v(kps_frame: dict, key: str):
     return float(p["v"]) if p else 0.0
 
 # ---------- quality & camera angle ----------
-def compute_quality(frames_kps: list, min_v: float = 0.5):
+def compute_quality(frames_kps: list, min_v: float = 0.35):
     """
-    Simple quality: fraction of frames where core joints are visible.
+    More tolerant quality score:
+    - frame_coverage: fraction of frames with >=6/8 core joints visible
+    - joint_visibility_mean: average visible-joint ratio over frames
+    - tracked_frame_ratio: fraction of frames with any landmarks detected
     """
     core = ["l_shoulder", "r_shoulder", "l_elbow", "r_elbow", "l_wrist", "r_wrist", "l_hip", "r_hip"]
-    good = 0
+    total = max(1, len(frames_kps))
+
+    tracked = 0
+    covered = 0
+    vis_sum = 0.0
+
     for f in frames_kps:
-        if not f:
-            continue
-        ok = True
-        for k in core:
-            if kp_v(f, k) < min_v:
-                ok = False
-                break
-        if ok:
-            good += 1
-    return good / max(1, len(frames_kps))
+        if f:
+            tracked += 1
+        n_vis = sum(1 for k in core if kp_v(f, k) >= min_v)
+        vis_ratio = n_vis / float(len(core))
+        vis_sum += vis_ratio
+        if n_vis >= 6:
+            covered += 1
+
+    frame_coverage = covered / total
+    joint_visibility_mean = vis_sum / total
+    tracked_frame_ratio = tracked / total
+    quality_score = 0.6 * frame_coverage + 0.4 * joint_visibility_mean
+
+    return {
+        "quality_score": float(quality_score),
+        "frame_coverage": float(frame_coverage),
+        "joint_visibility_mean": float(joint_visibility_mean),
+        "tracked_frame_ratio": float(tracked_frame_ratio),
+        "min_visibility_threshold": float(min_v),
+    }
 
 def estimate_camera_angle(frames_kps: list):
     """
-    Very rough: if shoulder width (pixel distance between L/R shoulders) is large -> more side-ish.
+    Estimate camera angle from torso geometry.
+    Uses shoulder-width / torso-height ratio so it is less sensitive to zoom/resolution:
+      - smaller ratio => more side view (shoulders appear narrower)
+      - larger ratio => more front/back view
     """
-    widths = []
+    ratios = []
     for f in frames_kps:
         ls = kp_xy(f, "l_shoulder")
         rs = kp_xy(f, "r_shoulder")
-        if ls and rs:
-            widths.append(abs(ls[0] - rs[0]))
-    if not widths:
+        lh = kp_xy(f, "l_hip")
+        rh = kp_xy(f, "r_hip")
+        if not (ls and rs and lh and rh):
+            continue
+
+        shoulder_w = abs(ls[0] - rs[0])
+        sh_mid = avg_pt(ls, rs)
+        hip_mid = avg_pt(lh, rh)
+        torso_h = abs(sh_mid[1] - hip_mid[1])
+        if torso_h < 1.0:
+            continue
+
+        ratios.append(shoulder_w / torso_h)
+
+    if not ratios:
         return "unknown"
-    w_med = float(np.median(widths))
-    # heuristics: tune later
-    if w_med > 160:
+
+    r_med = float(np.median(ratios))
+    # Heuristics; side-view should typically have a narrower shoulder profile.
+    if r_med < 0.58:
         return "side_view"
-    if w_med > 90:
+    if r_med < 0.90:
         return "semi_side_view"
     return "front_or_back"
 
@@ -259,7 +325,7 @@ def analyze_forehand(frames_kps: list, contact_i: int, handedness: str, meta: di
         if w_end:
             forward = dist(w0, w_end) / max(1.0, meta["width"])
             metrics["follow_through_disp_norm"] = forward
-            if forward < 0.06:
+            if forward < FOLLOW_THROUGH_MIN_NORM:
                 flags.append("weak_follow_through")
 
     return metrics, flags
@@ -302,7 +368,7 @@ def analyze_backhand(frames_kps: list, contact_i: int, handedness: str, meta: di
         if w_end:
             disp = dist(w0, w_end) / max(1.0, meta["width"])
             metrics["follow_through_disp_norm"] = disp
-            if disp < 0.06:
+            if disp < FOLLOW_THROUGH_MIN_NORM:
                 flags.append("weak_follow_through")
 
     return metrics, flags
@@ -386,26 +452,50 @@ async def analyze(
         f.write(await file.read())
 
     frames_kps, times, meta = extract_pose_keypoints(path, target_fps=12)
-    quality = compute_quality(frames_kps)
+    quality_diag = compute_quality(frames_kps)
+    quality = quality_diag["quality_score"]
     cam = estimate_camera_angle(frames_kps)
 
     contact_i, speeds = find_contact_frame(frames_kps, handedness)
 
     # If quality is low, return early with guidance (prevents bad advice)
-    if quality < 0.35 or cam == "unknown":
+    if quality < 0.20 or quality_diag["tracked_frame_ratio"] < 0.15:
+        coach_feedback = None
+        nova_error = None
+        try:
+            coach_feedback = nova_coach_feedback(
+                {
+                    "shot_type": shot_type,
+                    "handedness": handedness,
+                    "camera_angle": cam,
+                    "metrics": {},
+                    "flags": ["low_pose_quality"],
+                    "perfect_standard": {
+                        "focus": shot_type,
+                        "targets": ["Full body in frame", "Good lighting", "Side view (90°)"],
+                    },
+                }
+            )
+        except Exception as e:
+            nova_error = str(e)
+
         return {
             "ok": False,
             "saved": fname,
             "quality_score": quality,
+            "quality_diagnostics": quality_diag,
             "camera_angle": cam,
             "message": "Pose tracking quality is low. Please re-record: full body in frame, good lighting, side view.",
+            "coach_feedback": coach_feedback,
+            "nova_error": nova_error,
         }
 
+    warnings = []
     if cam == "front_or_back":
-        # allow but warn (or you can hard-fail)
-        warning = "Camera angle looks front/back. Side view (90°) is recommended for best accuracy."
-    else:
-        warning = None
+        warnings.append("Camera angle looks front/back. Side view (90°) is recommended for best accuracy.")
+    if quality < 0.35:
+        warnings.append("Pose tracking quality is moderate. Results may be less stable than usual.")
+    warning = " ".join(warnings) if warnings else None
 
     if shot_type == "forehand":
         metrics, flags = analyze_forehand(frames_kps, contact_i, handedness, meta)
@@ -469,6 +559,7 @@ async def analyze(
         "handedness": handedness,
         "shot_type": shot_type,
         "quality_score": quality,
+        "quality_diagnostics": quality_diag,
         "camera_angle": cam,
         "warning": warning,
         "meta": meta,

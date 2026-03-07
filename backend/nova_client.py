@@ -1,19 +1,31 @@
 import json
 import os
+import re
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-DEFAULT_MODEL_ID = os.getenv("NOVA_MODEL_ID", "amazon.nova-lite-v1:0")  # lite is a great default
+# ----------------------------
+# Config
+# ----------------------------
+
+DEFAULT_MODEL_ID = os.getenv("NOVA_MODEL_ID", "amazon.nova-lite-v1:0")
 DEFAULT_REGION = os.getenv("AWS_REGION", "us-east-1")
 
-# Nova calls can take longer; AWS recommends increasing timeouts.
-# See Nova Converse API guide. :contentReference[oaicite:8]{index=8}
+# Increase timeout because LLM calls can take longer
 _bedrock_runtime = boto3.client(
     "bedrock-runtime",
     region_name=DEFAULT_REGION,
-    config=Config(connect_timeout=3600, read_timeout=3600, retries={"max_attempts": 1}),
+    config=Config(
+        connect_timeout=3600,
+        read_timeout=3600,
+        retries={"max_attempts": 1},
+    ),
 )
+
+# ----------------------------
+# System Prompt
+# ----------------------------
 
 SYSTEM_PROMPT = """You are a supportive professional tennis coach.
 
@@ -36,19 +48,60 @@ Rules:
 Return only JSON.
 """
 
+# ----------------------------
+# Helper: Extract JSON from LLM output
+# ----------------------------
+
+def _extract_json(text: str) -> dict:
+    """
+    Extract JSON object from model output.
+    Handles:
+    - ```json ... ``` fenced blocks
+    - extra text before/after JSON
+    """
+    if not text:
+        raise ValueError("Empty model output")
+
+    s = text.strip()
+
+    # Remove fenced code block wrappers
+    s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*```$", "", s)
+
+    # Try direct parse
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+
+    # Try extracting first {...} block
+    match = re.search(r"\{.*\}", s, flags=re.DOTALL)
+    if not match:
+        raise ValueError("No JSON object found in output")
+
+    return json.loads(match.group(0))
+
+
+# ----------------------------
+# Main Nova Call
+# ----------------------------
+
 def nova_coach_feedback(payload: dict, model_id: str = DEFAULT_MODEL_ID) -> dict:
     """
     Calls Amazon Nova via Bedrock Converse API and returns parsed JSON.
-    Model IDs (examples): amazon.nova-lite-v1:0, amazon.nova-pro-v1:0 :contentReference[oaicite:9]{index=9}
     """
+
     user_message = json.dumps(payload, ensure_ascii=False)
 
     messages = [
-        {"role": "user", "content": [{"text": user_message}]}
+        {
+            "role": "user",
+            "content": [{"text": user_message}]
+        }
     ]
 
     try:
-        resp = _bedrock_runtime.converse(
+        response = _bedrock_runtime.converse(
             modelId=model_id,
             messages=messages,
             system=[{"text": SYSTEM_PROMPT}],
@@ -57,20 +110,26 @@ def nova_coach_feedback(payload: dict, model_id: str = DEFAULT_MODEL_ID) -> dict
                 "temperature": 0.4,
                 "topP": 0.9,
             },
-            # Nova also supports topK via additionalModelRequestFields (optional). :contentReference[oaicite:10]{index=10}
-            additionalModelRequestFields={"topK": 50},
         )
-        text = resp["output"]["message"]["content"][0]["text"]
+
+        text = response["output"]["message"]["content"][0]["text"]
+
     except (ClientError, Exception) as e:
         raise RuntimeError(f"Nova call failed: {e}")
 
-    # Best-effort JSON parse
+    # Robust JSON parsing
     try:
-        return json.loads(text)
+        return _extract_json(text)
     except Exception:
         return {
             "encouragement": "Nice effort—your swing has a solid base.",
-            "issues": [{"flag": "parse_error", "why_it_matters": "Model returned non-JSON.", "fixes": ["Try again."]}],
+            "issues": [
+                {
+                    "flag": "parse_error",
+                    "why_it_matters": "Model returned non-JSON output.",
+                    "fixes": ["Try again."]
+                }
+            ],
             "perfect_standard": {},
             "closing": f"Raw output: {text[:500]}",
         }
