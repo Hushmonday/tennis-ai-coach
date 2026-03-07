@@ -40,3 +40,10 @@ yarn-error.log*
 # =========================
 *.pem
 *.key
+
+test_videos/
+*.mp4
+*.mov
+*.webm
+test_videos/
+*.mp4
