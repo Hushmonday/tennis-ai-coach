@@ -35,15 +35,26 @@ You will receive:
 - camera_angle: side_view | semi_side_view | front_or_back | unknown
 - metrics: numeric measurements
 - flags: detected issues (strings)
+- analysis_scope: indicates what was/wasn't evaluated (e.g., ball trajectory)
+- ball_track: ball-flight summary (may be unavailable if tracking confidence is low)
 
 Rules:
-1) Start with 1 positive observation.
-2) For each flag, explain why it matters in 1 sentence.
-3) Give 1-2 actionable fixes per flag.
-4) Provide a "Perfect / Pro-level standard" section using approximate ranges or qualitative targets.
-5) End with encouragement.
-6) Do NOT invent measurements.
-7) Output JSON with keys: encouragement, issues, perfect_standard, closing.
+1) Start with 1-2 positive observations tied to this specific video.
+2) Use at least 2 metric values from input if available (include metric key + number).
+3) Use non-judgmental tone: frame issues as "focus areas" or "next improvements", not failures.
+4) For each focus area, explain why it matters in 1 sentence.
+5) Give 1-2 actionable fixes per focus area.
+6) If there are no flags, provide one "next-level improvement" instead.
+7) Provide a "Perfect / Pro-level standard" section using approximate ranges or qualitative targets.
+8) End with short encouragement.
+9) Do NOT invent measurements.
+10) Avoid generic repeated phrases like "great work" or "keep it up" unless grounded in metrics.
+11) Always include one concrete next_step drill/action.
+12) Keep focus areas concise (max 2 main focus areas) to avoid overwhelming the player.
+13) Output JSON with keys: encouragement, issues, next_step, perfect_standard, closing.
+14) If analysis_scope says ball trajectory/placement is not evaluated, explicitly avoid judging serve accuracy/placement.
+15) If ball_track tracked_ratio >= 0.45, include at least one observation tied to ball flight (curve, bounce timing, or track confidence).
+16) Do not recommend trajectory-stability work unless ball_lateral_curve_norm > 0.12 with adequate tracking confidence.
 
 Return only JSON.
 """
@@ -107,7 +118,7 @@ def nova_coach_feedback(payload: dict, model_id: str = DEFAULT_MODEL_ID) -> dict
             system=[{"text": SYSTEM_PROMPT}],
             inferenceConfig={
                 "maxTokens": 800,
-                "temperature": 0.4,
+                "temperature": 0.7,
                 "topP": 0.9,
             },
         )
@@ -130,6 +141,7 @@ def nova_coach_feedback(payload: dict, model_id: str = DEFAULT_MODEL_ID) -> dict
                     "fixes": ["Try again."]
                 }
             ],
+            "next_step": "Record another clip with the same camera angle and focus on one adjustment only.",
             "perfect_standard": {},
             "closing": f"Raw output: {text[:500]}",
         }

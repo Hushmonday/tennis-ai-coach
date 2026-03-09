@@ -7,7 +7,32 @@ type AnalyzeResponse = {
   message?: string;
   warning?: string | null;
   quality_score?: number;
+  overall_score?: number;
+  score_breakdown?: {
+    tracking_score?: number;
+    camera_score?: number;
+    technique_score?: number;
+    flag_penalty?: number;
+    reliability_penalty?: number;
+    technique_details?: Record<string, number | string>;
+  };
   camera_angle?: string;
+  analysis_scope?: {
+    pose_mechanics?: boolean;
+    ball_trajectory?: boolean;
+    serve_placement?: boolean;
+  };
+  ball_track?: {
+    ok?: boolean;
+    tracked_ratio?: number;
+    points_count?: number;
+    duration_s?: number;
+    lateral_curve_norm?: number;
+    vertical_drop_norm?: number;
+    bounce_detected?: boolean;
+    bounce_t?: number;
+    bounce_x_norm?: number;
+  };
   contact_frame_index?: number;
   metrics?: Record<string, number>;
   flags?: string[];
@@ -29,6 +54,7 @@ type CoachView = {
   encouragement: string;
   closing: string;
   issues: CoachIssue[];
+  nextSteps: string[];
   perfectFocus: string;
   perfectTargets: string[];
 };
@@ -56,11 +82,14 @@ function normalizeLabel(raw: string): string {
 function parseCoachFeedback(
   raw: unknown,
   fallbackPerfect?: { focus?: string; targets?: string[] },
+  flags?: string[],
+  metrics?: Record<string, number>,
 ): CoachView {
   const fallback: CoachView = {
     encouragement: "Nice effort. Your swing shows a good base to build on.",
     closing: "Keep training with consistent camera angle and lighting for better feedback.",
     issues: [],
+    nextSteps: buildFallbackNextSteps(flags, metrics),
     perfectFocus: fallbackPerfect?.focus || "Shot Standard",
     perfectTargets: fallbackPerfect?.targets || [],
   };
@@ -77,7 +106,23 @@ function parseCoachFeedback(
 
   const issuesRaw = data.issues;
   const issues: CoachIssue[] = [];
-  if (issuesRaw && typeof issuesRaw === "object") {
+  if (Array.isArray(issuesRaw)) {
+    for (const item of issuesRaw) {
+      if (!item || typeof item !== "object") continue;
+      const v = item as Record<string, unknown>;
+      const nameRaw = v.flag || v.issue || v.title || "Improvement";
+      const whyRaw = v.why_it_matters || v.why || v.reason || "";
+      const fixesRaw = v.fixes || v.suggestions || [];
+      const fixes = Array.isArray(fixesRaw)
+        ? fixesRaw.filter((x): x is string => typeof x === "string")
+        : [];
+      issues.push({
+        name: normalizeLabel(String(nameRaw)),
+        why: typeof whyRaw === "string" ? whyRaw : "",
+        fixes,
+      });
+    }
+  } else if (issuesRaw && typeof issuesRaw === "object") {
     for (const [key, value] of Object.entries(issuesRaw as Record<string, unknown>)) {
       if (!value || typeof value !== "object") continue;
       const v = value as Record<string, unknown>;
@@ -89,6 +134,27 @@ function parseCoachFeedback(
         fixes,
       });
     }
+  }
+
+  const nextSteps: string[] = [];
+  if (typeof data.next_step === "string" && data.next_step.trim().length > 0) {
+    nextSteps.push(data.next_step.trim());
+  }
+  if (Array.isArray(data.next_steps)) {
+    nextSteps.push(
+      ...data.next_steps
+        .filter((x): x is string => typeof x === "string")
+        .map((x) => x.trim())
+        .filter((x) => x.length > 0),
+    );
+  }
+  if (Array.isArray(data.improvements)) {
+    nextSteps.push(
+      ...data.improvements
+        .filter((x): x is string => typeof x === "string")
+        .map((x) => x.trim())
+        .filter((x) => x.length > 0),
+    );
   }
 
   const perfectRaw = data.perfect_standard;
@@ -106,14 +172,78 @@ function parseCoachFeedback(
     encouragement,
     closing,
     issues,
+    nextSteps: nextSteps.length > 0 ? nextSteps : buildFallbackNextSteps(flags, metrics),
     perfectFocus,
     perfectTargets,
   };
 }
 
+function buildFallbackNextSteps(flags?: string[], metrics?: Record<string, number>): string[] {
+  const f = flags || [];
+  const m = metrics || {};
+
+  if (f.includes("weak_follow_through") || (m.follow_through_disp_norm ?? 1) < 0.035) {
+    return [
+      "After contact, finish with a fuller wrap and hold finish for 1 second to groove complete follow-through.",
+      "Do 3 sets of 10 shadow swings focused on contact-to-finish continuity.",
+    ];
+  }
+  if (f.includes("contact_too_close_to_body") || f.includes("too_close_to_body")) {
+    return [
+      "Set contact slightly farther in front by spacing your stance and meeting the ball earlier.",
+      "Use a cone target in front of lead hip and rehearse hitting through that point.",
+    ];
+  }
+  if (f.includes("low_contact") || (m.wrist_vs_shoulder_normY_at_contact ?? -1) > 0) {
+    return [
+      "Reach higher at serve contact by extending upward before pronation.",
+      "Practice toss and reach drills: 15 reps per set, 3 sets.",
+    ];
+  }
+  if (f.includes("no_knee_bend") || (m.min_knee_angle_deg ?? 0) > 155) {
+    return [
+      "Add more knee flex in loading phase, then drive up through legs before contact.",
+      "Do serve rhythm drill: bend-hold-drive for 3 sets of 8 serves.",
+    ];
+  }
+  if (f.includes("ball_trajectory_very_curved") || f.includes("ball_trajectory_curved")) {
+    const conf = typeof m.ball_track_confidence === "number" ? m.ball_track_confidence : 0;
+    if (conf < 0.45) {
+      return [
+        "Ball tracking was low confidence in this clip, so focus first on repeatable contact and body timing.",
+        "Record another clip with better ball visibility, then we can give more reliable trajectory-specific coaching.",
+      ];
+    }
+    return [
+      "Stabilize toss/contact alignment and aim through the center line to reduce unintended side curve.",
+      "Use target-serving drill: 3 sets of 8 serves with focus on repeatable toss position and same contact point.",
+    ];
+  }
+  if (typeof m.elbow_angle_at_contact_deg === "number" && m.elbow_angle_at_contact_deg > 112) {
+    return [
+      "Keep a bit more bend at contact to improve whip and control.",
+      "Use half-speed forehands focusing on relaxed elbow and smooth acceleration.",
+    ];
+  }
+
+  return [
+    "Next level: improve consistency by repeating 20 controlled reps with same setup and camera angle.",
+    "Track one metric per session (for example follow-through displacement) and aim for steady week-over-week improvement.",
+  ];
+}
+
 function formatMetricValue(value: number): string {
   if (!Number.isFinite(value)) return "-";
   return Math.abs(value) >= 100 ? value.toFixed(1) : value.toFixed(3);
+}
+
+function scoreLabel(score?: number): string {
+  const s = score ?? 0;
+  if (s >= 85) return "Excellent Progress";
+  if (s >= 70) return "Strong Foundation";
+  if (s >= 55) return "Good Momentum";
+  if (s >= 40) return "Building Consistency";
+  return "Early Development";
 }
 
 function metricExplanation(key: string): { title: string; meaning: string } {
@@ -154,6 +284,26 @@ function metricExplanation(key: string): { title: string; meaning: string } {
       title: "Upward Drive",
       meaning: "How much hips move upward into contact during serve. Bigger = stronger leg drive.",
     },
+    ball_track_confidence: {
+      title: "Ball Track Confidence",
+      meaning: "How consistently the ball was tracked (0 to 1). Higher means more reliable ball-flight analysis.",
+    },
+    ball_lateral_curve_norm: {
+      title: "Ball Lateral Curve",
+      meaning: "Sideways curvature of the ball path. Higher means more side curve in flight.",
+    },
+    ball_vertical_drop_norm: {
+      title: "Ball Vertical Drop",
+      meaning: "Vertical drop of tracked ball path. Higher means stronger downward arc.",
+    },
+    ball_avg_speed_px_s: {
+      title: "Ball Average Speed (px/s)",
+      meaning: "Average 2D ball speed in frame pixels/second. Compare across clips with similar camera setup.",
+    },
+    ball_contact_to_bounce_s: {
+      title: "Contact To Bounce Time (s)",
+      meaning: "Estimated time from racket contact to bounce. Useful as rough depth/speed signal on serve.",
+    },
   };
   return m[key] || {
     title: normalizeLabel(key),
@@ -183,8 +333,8 @@ export default function App() {
   const [result, setResult] = useState<AnalyzeResponse | null>(null);
 
   const coachView = useMemo(
-    () => parseCoachFeedback(result?.coach_feedback, result?.perfect_standard),
-    [result?.coach_feedback, result?.perfect_standard],
+    () => parseCoachFeedback(result?.coach_feedback, result?.perfect_standard, result?.flags, result?.metrics),
+    [result?.coach_feedback, result?.perfect_standard, result?.flags, result?.metrics],
   );
 
   useEffect(() => {
@@ -443,13 +593,36 @@ export default function App() {
             <h2>Analysis Result</h2>
 
             {!result.ok ? (
-              <div className="result-card bad">
-                <h3>Tracking quality is too low</h3>
-                <p>{result.message}</p>
-              </div>
+              <>
+                <div className="result-card bad">
+                  <h3>Analysis unavailable for this clip</h3>
+                  <p>{result.message}</p>
+                  <p>
+                    <strong>What this means:</strong> score and detailed coaching are not reliable for this clip.
+                  </p>
+                </div>
+                <article className="result-card coach-text">
+                  <h3>Quick Fixes For Next Recording</h3>
+                  <ul>
+                    <li>Place camera at side view (about 90°) and keep full body in frame.</li>
+                    <li>Record in brighter light and avoid strong shadows/backlight.</li>
+                    <li>Use a stable camera position and avoid zooming while recording.</li>
+                    <li>Capture at least 2-3 full swings in one clip for better tracking stability.</li>
+                  </ul>
+                </article>
+              </>
             ) : (
               <>
                 <div className="result-grid">
+                  <article className="result-card score-card">
+                    <h3>Development Score</h3>
+                    <div className="score-number">{result.overall_score ?? "-"}</div>
+                    <div className="score-bar">
+                      <span style={{ width: `${Math.max(0, Math.min(100, result.overall_score || 0))}%` }} />
+                    </div>
+                    <small>{scoreLabel(result.overall_score)} · 0-100 (higher is better)</small>
+                  </article>
+
                   <article className="result-card">
                     <h3>Overview</h3>
                     <p>
@@ -466,10 +639,48 @@ export default function App() {
                         <strong>Warning:</strong> {result.warning}
                       </p>
                     )}
+                    {result.score_breakdown && (
+                      <>
+                        <p>
+                          <strong>Score math:</strong> tracking + camera + technique - penalties
+                        </p>
+                        <p>
+                          <strong>Tracking:</strong> {formatMetricValue(result.score_breakdown.tracking_score || 0)}
+                          {" | "}
+                          <strong>Camera:</strong> {formatMetricValue(result.score_breakdown.camera_score || 0)}
+                          {" | "}
+                          <strong>Technique:</strong> {formatMetricValue(result.score_breakdown.technique_score || 0)}
+                        </p>
+                      </>
+                    )}
+                    {result.analysis_scope && !result.analysis_scope.ball_trajectory && (
+                      <p>
+                        <strong>Note:</strong> This analysis does not score ball flight path or landing accuracy.
+                      </p>
+                    )}
                   </article>
 
                   <article className="result-card">
-                    <h3>Coaching Flags</h3>
+                    <h3>Ball Tracking</h3>
+                    {result.ball_track?.ok ? (
+                      <>
+                        <p>
+                          <strong>Confidence:</strong> {formatMetricValue(result.ball_track.tracked_ratio || 0)}
+                        </p>
+                        <p>
+                          <strong>Lateral curve:</strong> {formatMetricValue(result.ball_track.lateral_curve_norm || 0)}
+                        </p>
+                        <p>
+                          <strong>Bounce:</strong> {result.ball_track.bounce_detected ? "Detected" : "Not detected"}
+                        </p>
+                      </>
+                    ) : (
+                      <p>Ball tracking is limited in this clip. Use clearer ball visibility and steady camera.</p>
+                    )}
+                  </article>
+
+                  <article className="result-card">
+                    <h3>Focus Areas</h3>
                     {result.flags && result.flags.length > 0 ? (
                       <div className="chip-list">
                         {result.flags.map((flag) => (
@@ -479,7 +690,7 @@ export default function App() {
                         ))}
                       </div>
                     ) : (
-                      <p>No major flags.</p>
+                      <p>No major focus areas detected.</p>
                     )}
                   </article>
 
@@ -520,8 +731,15 @@ export default function App() {
                       ))}
                     </div>
                   ) : (
-                    <p>No critical issue detected from this clip.</p>
+                    <p>No major fault detected. Focus on these next-step improvements:</p>
                   )}
+
+                  <h4>Action Plan</h4>
+                  <ul>
+                    {coachView.nextSteps.map((step) => (
+                      <li key={step}>{step}</li>
+                    ))}
+                  </ul>
 
                   {coachView.perfectTargets.length > 0 && (
                     <>
