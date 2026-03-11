@@ -572,6 +572,12 @@ export default function App() {
           <button className="analyze-btn" type="button" onClick={analyze} disabled={uploading}>
             {uploading ? "Analyzing..." : "Upload & Analyze"}
           </button>
+          {uploading && (
+            <div className="loading-indicator" role="status" aria-live="polite">
+              <span className="tennis-ball" aria-hidden="true" />
+              <span>AI coach is analyzing your swing...</span>
+            </div>
+          )}
 
           {recordedPreviewUrl && mode === "record" && (
             <div className="preview-block">
